@@ -699,12 +699,27 @@ def build_excel(summary, roles_df, detail_df, missing_epi_df, missing_roles_df, 
         ok_fmt = workbook.add_format({"bg_color": "#E2F0D9"})
         fail_fmt = workbook.add_format({"bg_color": "#FCE4D6"})
 
-        for sheet_name in ["Resumo", "Cargos", "Detalhado", "Faltas EPI", "Cargos ausentes", "Extras sistema"]:
+        # Usa os próprios DataFrames para definir o intervalo do filtro.
+        # Não usamos ws.dim_rowmax/ws.dim_colmax porque o XlsxWriter pode
+        # deixá-los como None em planilhas sem linhas/colunas de dados.
+        sheet_frames = {
+            "Resumo": pd.DataFrame([summary]),
+            "Cargos": roles_df,
+            "Detalhado": detail_df,
+            "Faltas EPI": missing_epi_df,
+            "Cargos ausentes": missing_roles_df,
+            "Extras sistema": extras_df,
+        }
+
+        for sheet_name, df in sheet_frames.items():
             ws = writer.sheets[sheet_name]
             ws.freeze_panes(1, 0)
-            ws.autofilter(0, 0, max(1, ws.dim_rowmax), max(0, ws.dim_colmax))
-            for col_idx, col in enumerate(pd.read_excel(output, sheet_name=sheet_name).columns if False else []):
-                pass
+
+            if len(df.columns) > 0:
+                # Linha 0 é o cabeçalho; a última linha de dados é len(df).
+                last_row = max(0, len(df))
+                last_col = len(df.columns) - 1
+                ws.autofilter(0, 0, last_row, last_col)
 
         # Reaplica larguras de forma simples.
         for sheet_name, df in [
