@@ -41,6 +41,9 @@ TOKEN_REPLACEMENTS = {
     "MEC": "MECANICO",
     "SOLDAR": "SOLDA",
     "SOLDADURA": "SOLDA",
+    # Equivalência de nomenclatura usada entre PGR e sistema.
+    # Ex.: "Técnico Orçamentista" <-> "Técnico de Orçamento".
+    "ORCAMENTISTA": "ORCAMENTO",
 }
 
 
