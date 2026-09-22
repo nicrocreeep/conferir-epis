@@ -44,6 +44,11 @@ TOKEN_REPLACEMENTS = {
     # Equivalência de nomenclatura usada entre PGR e sistema.
     # Ex.: "Técnico Orçamentista" <-> "Técnico de Orçamento".
     "ORCAMENTISTA": "ORCAMENTO",
+    "ANDAIMES": "ANDAIME",
+    "CARGAS": "CARGA",
+    "OBRAS": "OBRA",
+    "MATERIAIS": "MATERIAL",
+    "SERVICOS": "SERVICO",
 }
 
 
@@ -281,6 +286,614 @@ def read_pgr(file_bytes: bytes) -> Tuple[pd.DataFrame, List[str]]:
     # Só considera colunas que realmente aparecem como EPI no cabeçalho.
     epi_names = list(epi_columns.values())
     return pgr, epi_names
+
+
+# -----------------------------------------------------------------------------
+# Anexo I — Inventário de Riscos
+# -----------------------------------------------------------------------------
+
+def split_top_level(text: str) -> List[str]:
+    """Divide a lista de cargos, respeitando vírgulas dentro de parênteses."""
+    text = "" if text is None else str(text)
+    parts = []
+    current = []
+    depth = 0
+
+    for ch in text:
+        if ch == "(":
+            depth += 1
+        elif ch == ")" and depth > 0:
+            depth -= 1
+
+        if depth == 0 and ch in ";,":
+            piece = "".join(current).strip(" .")
+            if piece:
+                parts.append(piece)
+            current = []
+        else:
+            current.append(ch)
+
+    piece = "".join(current).strip(" .")
+    if piece:
+        parts.append(piece)
+
+    return parts
+
+
+def find_text_in_rows(raw: pd.DataFrame, prefix: str, max_rows: int = 10) -> str:
+    prefix_norm = strip_accents(prefix).upper()
+    for r in range(min(max_rows, len(raw))):
+        for c in range(raw.shape[1]):
+            value = str(raw.iat[r, c]) if pd.notna(raw.iat[r, c]) else ""
+            value_norm = strip_accents(value).upper().strip()
+            if value_norm.startswith(prefix_norm):
+                return value
+    return ""
+
+
+@st.cache_data(show_spinner=False)
+def read_inventory(file_bytes: bytes) -> pd.DataFrame:
+    """
+    Lê todas as abas do Anexo I e transforma cada linha de risco em um registro.
+    As funções do GHE/planilha são repetidas em cada registro para permitir
+    o cruzamento Cargo × Risco com o relatório do sistema.
+    """
+    excel = pd.ExcelFile(io.BytesIO(file_bytes))
+    records = []
+
+    for sheet_name in excel.sheet_names:
+        raw = pd.read_excel(excel, sheet_name=sheet_name, header=None)
+
+        functions_cell = find_text_in_rows(raw, "Função(s):", max_rows=8)
+        if not functions_cell:
+            # Ex.: Planilha1 oculta com tabelas auxiliares.
+            continue
+
+        functions_text = re.sub(
+            r"^\s*Função\(s\):\s*",
+            "",
+            functions_cell,
+            flags=re.IGNORECASE,
+        ).strip()
+
+        sector_cell = find_text_in_rows(raw, "Setor:", max_rows=8)
+        sector = re.sub(r"^\s*Setor:\s*", "", sector_cell, flags=re.IGNORECASE).strip()
+
+        ghe_cell = find_text_in_rows(raw, "GHE:", max_rows=5)
+        ghe = re.sub(r"^\s*GHE:\s*", "", ghe_cell, flags=re.IGNORECASE).strip()
+
+        risk_header_row = None
+        for r in range(min(15, len(raw))):
+            row_text = " ".join(
+                str(raw.iat[r, c]) if pd.notna(raw.iat[r, c]) else ""
+                for c in range(raw.shape[1])
+            )
+            row_norm = strip_accents(row_text).upper()
+            if (
+                "PERIGO OU FATOR DE RISCO OCUPACIONAL" in row_norm
+                and "RISCOS" in row_norm
+            ):
+                risk_header_row = r
+                break
+
+        if risk_header_row is None:
+            continue
+
+        for r in range(risk_header_row + 1, len(raw)):
+            item = str(raw.iat[r, 0]).strip() if raw.shape[1] > 0 and pd.notna(raw.iat[r, 0]) else ""
+            perigo = str(raw.iat[r, 2]).strip() if raw.shape[1] > 2 and pd.notna(raw.iat[r, 2]) else ""
+            risco = str(raw.iat[r, 3]).strip() if raw.shape[1] > 3 and pd.notna(raw.iat[r, 3]) else ""
+            tarefa = str(raw.iat[r, 1]).strip() if raw.shape[1] > 1 and pd.notna(raw.iat[r, 1]) else ""
+
+            if not perigo and not risco:
+                continue
+
+            # Ignora rodapés e textos fora da tabela de riscos.
+            if not item and not perigo:
+                continue
+
+            records.append({
+                "Planilha Inventário": sheet_name,
+                "GHE": ghe,
+                "Setor": sector,
+                "Funções no Inventário": functions_text,
+                "Cargos individuais": " | ".join(split_top_level(functions_text)),
+                "Item": item,
+                "Tarefa/Fonte": tarefa,
+                "Perigo/Fator de risco": perigo,
+                "Risco detalhado": risco,
+            })
+
+    inventory = pd.DataFrame(records)
+    if inventory.empty:
+        raise ValueError(
+            "Não foi possível localizar a tabela de riscos no Anexo I. "
+            "Verifique se o arquivo possui as colunas 'Perigo ou fator de risco ocupacional' e 'Riscos'."
+        )
+    return inventory
+
+
+def build_inventory_role_index(inventory: pd.DataFrame):
+    """Relaciona cada cargo do Anexo I às planilhas/GHEs onde ele aparece."""
+    alias_to_groups: Dict[str, List[Tuple[str, float]]] = defaultdict(list)
+
+    grouped = inventory.groupby(
+        ["Planilha Inventário", "GHE", "Setor", "Funções no Inventário"],
+        dropna=False,
+    ).size().reset_index(name="_n")
+
+    for _, row in grouped.iterrows():
+        functions = str(row["Funções no Inventário"])
+        group_key = (
+            str(row["Planilha Inventário"]),
+            str(row["GHE"]),
+            str(row["Setor"]),
+            str(row["Funções no Inventário"]),
+        )
+        for role_entry in split_top_level(functions):
+            for alias in expand_role_aliases(role_entry):
+                if alias:
+                    alias_to_groups[alias].append(
+                        (
+                            group_key,
+                            100.0,
+                        )
+                    )
+
+    return alias_to_groups, sorted(alias_to_groups.keys())
+
+
+def match_inventory_groups(system_role: str, alias_to_groups, inventory_aliases):
+    """
+    Encontra o(s) GHE(s) do Anexo I correspondentes ao cargo do sistema.
+    Usa primeiro igualdade normalizada; só depois aplica fuzzy com limiar
+    conservador para não espalhar um cargo entre vários GHEs.
+    """
+    aliases = expand_role_aliases(system_role)
+    matched = {}
+
+    for alias in aliases:
+        for group, score in alias_to_groups.get(alias, []):
+            matched[group] = max(matched.get(group, 0.0), score)
+
+    if not matched:
+        for alias in aliases:
+            if not alias:
+                continue
+            results = process.extract(
+                alias,
+                inventory_aliases,
+                scorer=fuzz.token_set_ratio,
+                limit=5,
+            )
+            for candidate, score, _ in results:
+                score2 = fuzz.ratio(alias, candidate)
+                final_score = max(float(score), float(score2))
+                if final_score >= 86:
+                    for group, _ in alias_to_groups.get(candidate, []):
+                        # Um fuzzy muito fraco não deve acumular múltiplos GHEs.
+                        matched[group] = max(matched.get(group, 0.0), final_score)
+
+    return sorted(matched), sorted(
+        matched.items(),
+        key=lambda item: -item[1],
+    )
+
+
+RISK_MARKERS = [
+    ("TRABALHO ESPAÇO CONFINADO", [
+        "TRABALHO ESPACO CONFINADO",
+        "ESPACO CONFINADO",
+    ]),
+    ("TRABALHO EM ALTURA", [
+        "TRABALHO EM ALTURA",
+    ]),
+    ("CHOQUE ELÉTRICO", [
+        "CHOQUE ELETRICO",
+    ]),
+    ("RUÍDO", [
+        "RUIDO",
+    ]),
+    ("VIBRAÇÃO MÃO-BRAÇO", [
+        "VIBRACAO DE MAOS E BRACO",
+        "VIBRACAO MAOS E BRACO",
+        "VIBRACOES LOCALIZADAS",
+        "VIBRACAO MAO BRACO",
+        "MAO BRACO",
+        "VMB",
+    ]),
+    ("VIBRAÇÃO CORPO INTEIRO", [
+        "VIBRACAO DE CORPO INTEIRO",
+        "VIBRACAO CORPO INTEIRO",
+        "VCI",
+    ]),
+    ("CALOR", [
+        "CALOR",
+    ]),
+    ("RADIAÇÃO NÃO IONIZANTE", [
+        "RADIACAO NAO IONIZANTE",
+    ]),
+    ("ARRANJO FÍSICO INADEQUADO", [
+        "ARRANJO FISICO INADEQUADO",
+    ]),
+    ("MOVIMENTOS INERENTES À FUNÇÃO", [
+        "MOVIMENTOS INERENTES A FUNCAO",
+        "MOVIMENTOS INERENTES",
+    ]),
+    ("MOVIMENTOS REPETITIVOS", [
+        "MOVIMENTOS REPETITIVOS",
+    ]),
+    ("ESTRESSE ORGANIZACIONAL", [
+        "ESTRESSE ORGANIZACIONAL",
+    ]),
+    ("ACETONA", [
+        "ACETONA",
+    ]),
+    ("GRAXA / ÓLEO MINERAL", [
+        "GRAXA A BASE DE OLEO MINERAL",
+        "GRAXA A BASE DE OLEO",
+        "OLEO MINERAL",
+    ]),
+    ("FUMOS METÁLICOS — CÁDMIO", [
+        "FUMOS METALICOS CADMIO",
+        "FUMOS MATALICOS CADMIO",
+    ]),
+    ("FUMOS METÁLICOS — MANGANÊS", [
+        "FUMOS METALICOS MANGANES",
+        "FUMOS MATALICOS MANGANES",
+    ]),
+    ("FUMOS METÁLICOS — ÓXIDO DE FERRO", [
+        "FUMOS METALICOS OXIDO DE FERRO",
+        "FUMOS MATALICOS OXIDO DE FERRO",
+    ]),
+    ("FUMOS METÁLICOS — COBRE", [
+        "FUMOS METALICOS COBRE",
+        "FUMOS MATALICOS COBRE",
+    ]),
+    ("FUMOS METÁLICOS — CHUMBO", [
+        "FUMOS METALICOS CHUMBO",
+        "FUMOS MATALICOS CHUMBO",
+    ]),
+    ("TOLUENO", ["TOLUENO"]),
+    ("XILENO", ["XILENO"]),
+    ("HEXANO", ["HEXANO"]),
+    ("BENZENO", ["BENZENO"]),
+    ("HIDROCARBONETOS", [
+        "HIDROCARBONETO",
+        "HIDROCARBONETOS",
+    ]),
+    ("POEIRA RESPIRÁVEL", [
+        "POEIRA RESPIRAVEL",
+    ]),
+    ("POEIRA MINERAL", [
+        "POEIRA MINERAL",
+    ]),
+    ("AGENTES BIOLÓGICOS", [
+        "AGENTES INFECCIOSOS",
+        "VIRUS BACTERIAS PATOGENICAS",
+        "VIRUS BACTERIAS",
+    ]),
+]
+
+
+def normalize_risk_text(text: str) -> str:
+    text = strip_accents("" if text is None else str(text)).upper()
+    text = text.replace("–", "-").replace("—", "-")
+    text = text.replace("\n", " ")
+    text = re.sub(r"[()\[\]{},;:/]+", " ", text)
+    text = re.sub(r"[^A-Z0-9\- ]+", " ", text)
+    text = text.replace("-", " ")
+    return normalize_spaces(text)
+
+
+def risk_family(text: str) -> str:
+    normalized = normalize_risk_text(text)
+
+    if "ERGONOM" in normalized or "PSICOSSOC" in normalized or "BIOMECAN" in normalized:
+        return "ERGONÔMICO"
+    if "FISICO" in normalized:
+        return "FÍSICO"
+    if "QUIMICO" in normalized:
+        return "QUÍMICO"
+    if "BIOLOGICO" in normalized:
+        return "BIOLÓGICO"
+    if any(word in normalized for word in ["ACIDENT", "MECANICO", "MECANICOS"]):
+        return "ACIDENTE"
+    return "OUTRO"
+
+
+def risk_marker(text: str) -> str:
+    normalized = normalize_risk_text(text)
+
+    for canonical, aliases in sorted(
+        RISK_MARKERS,
+        key=lambda item: max(len(alias) for alias in item[1]),
+        reverse=True,
+    ):
+        if any(alias in normalized for alias in aliases):
+            return canonical
+
+    if "NAO DETECTADO" in normalized or "NAO IDENTIFICADO" in normalized:
+        return "NÃO IDENTIFICADO"
+
+    return ""
+
+
+def compare_risk(system_risk: str, inventory_row: pd.Series):
+    """
+    Compara um risco do relatório com uma linha do Anexo I.
+    A comparação é propositalmente mais rígida que um fuzzy genérico:
+    família de risco e marcador precisam ser compatíveis.
+    """
+    system_family = risk_family(system_risk)
+    inventory_text = (
+        f"{inventory_row.get('Perigo/Fator de risco', '')} "
+        f"{inventory_row.get('Risco detalhado', '')}"
+    )
+    inventory_family = risk_family(inventory_text)
+
+    if system_family == "OUTRO" or inventory_family == "OUTRO":
+        return False, 0.0, ""
+
+    if system_family != inventory_family:
+        return False, 0.0, ""
+
+    system_marker = risk_marker(system_risk)
+    inventory_marker = risk_marker(inventory_text)
+
+    if system_marker and inventory_marker:
+        if system_marker == inventory_marker:
+            return True, 100.0, "MESMO MARCADOR"
+
+        # O relatório pode usar "Hidrocarboneto" de forma genérica enquanto
+        # o inventário detalha Tolueno/Xileno/Hexano/Benzeno, e vice-versa.
+        hydrocarbon_markers = {
+            "HIDROCARBONETOS",
+            "TOLUENO",
+            "XILENO",
+            "HEXANO",
+            "BENZENO",
+        }
+        if system_marker == "HIDROCARBONETOS" and inventory_marker in hydrocarbon_markers:
+            return True, 90.0, "FAMÍLIA HIDROCARBONETOS"
+        if inventory_marker == "HIDROCARBONETOS" and system_marker in hydrocarbon_markers:
+            return True, 88.0, "FAMÍLIA HIDROCARBONETOS"
+
+        return False, 0.0, ""
+
+    # Para casos em que não conseguimos extrair um marcador específico,
+    # exigimos sobreposição textual forte dentro da mesma família.
+    stopwords = {
+        "FISICO", "QUIMICO", "BIOLOGICO", "ERGONOMICO",
+        "PSICOSSOCIAIS", "COGNITIVOS", "BIOMECANICOS",
+        "MECANICOS", "ACIDENTES", "ACIDENTE",
+        "NAO", "DETECTADO", "IDENTIFICADO",
+    }
+
+    system_tokens = {
+        token for token in normalize_risk_text(system_risk).split()
+        if token not in stopwords
+    }
+    inventory_tokens = {
+        token for token in normalize_risk_text(inventory_text).split()
+        if token not in stopwords
+    }
+
+    overlap = system_tokens & inventory_tokens
+    if len(overlap) >= 2:
+        return True, 85.0, "TOKENS COMPARTILHADOS"
+
+    return False, 0.0, ""
+
+
+def analyze_risks(report: pd.DataFrame, inventory: pd.DataFrame):
+    """
+    Faz a auditoria bidirecional:
+    1) todo risco do Anexo I precisa aparecer no sistema;
+    2) riscos existentes no sistema que não aparecem no Anexo I são apontados
+       como extras para conferência.
+    """
+    alias_to_groups, inventory_aliases = build_inventory_role_index(inventory)
+
+    system_roles = sorted(
+        str(role).strip()
+        for role in report["Cargo"].dropna().unique()
+        if str(role).strip()
+    )
+
+    system_risks_by_role: Dict[str, List[str]] = defaultdict(list)
+    for _, row in report.iterrows():
+        role = str(row["Cargo"]).strip()
+        risk = str(row["Risco"]).strip()
+        if role and risk:
+            system_risks_by_role[role].append(risk)
+
+    for role in list(system_risks_by_role):
+        system_risks_by_role[role] = sorted(set(system_risks_by_role[role]))
+
+    detail_rows = []
+    missing_rows = []
+    extra_rows = []
+    missing_role_rows = []
+
+    all_groups = inventory.groupby(
+        ["Planilha Inventário", "GHE", "Setor", "Funções no Inventário"],
+        dropna=False,
+    ).size().reset_index(name="_n")
+
+    # Mapa de grupo -> índices de linhas de risco.
+    group_risk_rows = defaultdict(list)
+    for idx, row in inventory.iterrows():
+        key = (
+            str(row["Planilha Inventário"]),
+            str(row["GHE"]),
+            str(row["Setor"]),
+            str(row["Funções no Inventário"]),
+        )
+        group_risk_rows[key].append(idx)
+
+    matched_roles_info = []
+
+    for role in system_roles:
+        matched_groups, group_scores = match_inventory_groups(
+            role,
+            alias_to_groups,
+            inventory_aliases,
+        )
+
+        if not matched_groups:
+            missing_role_rows.append({
+                "Cargo no Sistema": role,
+                "Status": "CARGO NÃO ENCONTRADO NO ANEXO I",
+            })
+            matched_roles_info.append({
+                "Cargo no Sistema": role,
+                "GHE/Planilha": "",
+                "Setor": "",
+                "Confiança": 0.0,
+                "Status": "CARGO NÃO ENCONTRADO",
+            })
+
+            # Sem cargo correspondente no inventário, não classificamos os
+            # riscos como "extras": simplesmente não existe uma base de comparação.
+            continue
+
+        role_conf = max(score for _, score in group_scores) if group_scores else 100.0
+
+        matched_inventory_indexes = [
+            idx
+            for group_key in matched_groups
+            for idx in group_risk_rows.get(tuple(group_key), [])
+        ]
+        matched_inventory = [inventory.loc[idx] for idx in matched_inventory_indexes]
+
+        group_labels = []
+        for group_key in matched_groups:
+            group_label = " — ".join(
+                part for part in tuple(group_key)[:3] if part and part != "nan"
+            )
+            group_labels.append(group_label)
+
+        matched_roles_info.append({
+            "Cargo no Sistema": role,
+            "GHE/Planilha": " | ".join(group_labels),
+            "Setor": " | ".join(sorted({
+                str(row["Setor"]).strip()
+                for row in matched_inventory
+                if str(row["Setor"]).strip() and str(row["Setor"]).strip() != "nan"
+            })),
+            "Confiança": round(role_conf, 1),
+            "Status": "ATENDIDO",
+        })
+
+        # Para cada risco do sistema, encontra o melhor risco do Anexo I.
+        used_inventory_indexes = set()
+        for system_risk in system_risks_by_role.get(role, []):
+            best_match = None
+
+            for idx in matched_inventory_indexes:
+                inv_row = inventory.loc[idx]
+                ok, score, reason = compare_risk(system_risk, inv_row)
+                if not ok:
+                    continue
+
+                candidate = (inv_row, score, reason, idx)
+                if best_match is None or score > best_match[1]:
+                    best_match = candidate
+
+            if best_match is None:
+                extra_rows.append({
+                    "Cargo no Sistema": role,
+                    "GHE/Planilha": " | ".join(group_labels),
+                    "Setor": " | ".join(sorted({
+                        str(row["Setor"]).strip()
+                        for row in matched_inventory
+                        if str(row["Setor"]).strip() and str(row["Setor"]).strip() != "nan"
+                    })),
+                    "Risco do Sistema": system_risk,
+                    "Família": risk_family(system_risk),
+                    "Status": "EXTRA NO SISTEMA",
+                })
+                continue
+
+            inv_row, score, reason, idx = best_match
+            used_inventory_indexes.add(idx)
+            status = "ATENDIDO" if score >= 92 else "ATENDIDO — CORRESPONDÊNCIA PROVÁVEL"
+
+            detail_rows.append({
+                "Cargo no Sistema": role,
+                "GHE/Planilha": " | ".join(group_labels),
+                "Setor": str(inv_row["Setor"]).strip(),
+                "Confiança cargo": round(role_conf, 1),
+                "Risco do Sistema": system_risk,
+                "Família": risk_family(system_risk),
+                "Risco/Perigo no Anexo I": str(inv_row["Perigo/Fator de risco"]).strip(),
+                "Risco detalhado no Anexo I": str(inv_row["Risco detalhado"]).strip(),
+                "Confiança risco": score,
+                "Status": status,
+            })
+
+        # Agora o caminho inverso: todo risco do inventário deve aparecer no sistema.
+        for idx in matched_inventory_indexes:
+            inv_row = inventory.loc[idx]
+            inventory_text = (
+                f"{inv_row['Perigo/Fator de risco']} "
+                f"{inv_row['Risco detalhado']}"
+            )
+            matched_any = False
+            best_system = None
+
+            for system_risk in system_risks_by_role.get(role, []):
+                ok, score, reason = compare_risk(system_risk, inv_row)
+                if ok:
+                    matched_any = True
+                    candidate = (system_risk, score, reason)
+                    if best_system is None or score > best_system[1]:
+                        best_system = candidate
+
+            if not matched_any:
+                missing_rows.append({
+                    "Cargo no Sistema": role,
+                    "GHE/Planilha": " | ".join(group_labels),
+                    "Setor": str(inv_row["Setor"]).strip(),
+                    "Item": str(inv_row["Item"]).strip(),
+                    "Perigo/Fator de risco": str(inv_row["Perigo/Fator de risco"]).strip(),
+                    "Risco detalhado": str(inv_row["Risco detalhado"]).strip(),
+                    "Status": "FALTA NO SISTEMA",
+                })
+
+    detail_df = pd.DataFrame(detail_rows)
+    missing_df = pd.DataFrame(missing_rows)
+    extras_df = pd.DataFrame(extra_rows)
+    missing_roles_df = pd.DataFrame(missing_role_rows)
+    matched_roles_df = pd.DataFrame(matched_roles_info)
+
+    inventory_roles = set()
+    for functions_text in inventory["Funções no Inventário"].dropna().astype(str):
+        for role_entry in split_top_level(functions_text):
+            base = re.split(r"\(", role_entry, maxsplit=1)[0].strip(" ,.")
+            if base:
+                inventory_roles.add(normalize_role(base))
+
+    risk_summary = {
+        "cargos_inventario": int(len(inventory_roles)),
+        "cargos_sistema_risco": int(len(system_roles)),
+        "cargos_sem_inventario": int(len(missing_roles_df)),
+        "riscos_atendidos": int(
+            detail_df["Status"].isin(["ATENDIDO", "ATENDIDO — CORRESPONDÊNCIA PROVÁVEL"]).sum()
+        ) if not detail_df.empty else 0,
+        "riscos_em_falta": int(len(missing_df)),
+        "riscos_extras_sistema": int(len(extras_df)),
+    }
+
+    return (
+        risk_summary,
+        matched_roles_df,
+        detail_df,
+        missing_df,
+        extras_df,
+        missing_roles_df,
+    )
 
 
 # -----------------------------------------------------------------------------
@@ -679,15 +1292,32 @@ def analyze(report: pd.DataFrame, pgr: pd.DataFrame, epi_names: List[str]):
 # -----------------------------------------------------------------------------
 
 
-def build_excel(summary, roles_df, detail_df, missing_epi_df, missing_roles_df, extras_df):
+def build_excel(
+    summary,
+    roles_df,
+    detail_df,
+    missing_epi_df,
+    missing_roles_df,
+    extras_df,
+    risk_roles_df,
+    risk_detail_df,
+    risk_missing_df,
+    risk_extras_df,
+    risk_missing_roles_df,
+):
     output = io.BytesIO()
     with pd.ExcelWriter(output, engine="xlsxwriter") as writer:
         pd.DataFrame([summary]).to_excel(writer, sheet_name="Resumo", index=False)
         roles_df.to_excel(writer, sheet_name="Cargos", index=False)
-        detail_df.to_excel(writer, sheet_name="Detalhado", index=False)
+        detail_df.to_excel(writer, sheet_name="Detalhado EPI", index=False)
         missing_epi_df.to_excel(writer, sheet_name="Faltas EPI", index=False)
-        missing_roles_df.to_excel(writer, sheet_name="Cargos ausentes", index=False)
-        extras_df.to_excel(writer, sheet_name="Extras sistema", index=False)
+        missing_roles_df.to_excel(writer, sheet_name="Cargos ausentes EPI", index=False)
+        extras_df.to_excel(writer, sheet_name="Extras EPI", index=False)
+        risk_roles_df.to_excel(writer, sheet_name="Cargos x Inventário", index=False)
+        risk_detail_df.to_excel(writer, sheet_name="Detalhado Riscos", index=False)
+        risk_missing_df.to_excel(writer, sheet_name="Faltas Riscos", index=False)
+        risk_extras_df.to_excel(writer, sheet_name="Extras Riscos", index=False)
+        risk_missing_roles_df.to_excel(writer, sheet_name="Cargos ausentes Risco", index=False)
 
         workbook = writer.book
         header_fmt = workbook.add_format({
@@ -698,17 +1328,20 @@ def build_excel(summary, roles_df, detail_df, missing_epi_df, missing_roles_df, 
         })
         ok_fmt = workbook.add_format({"bg_color": "#E2F0D9"})
         fail_fmt = workbook.add_format({"bg_color": "#FCE4D6"})
+        probable_fmt = workbook.add_format({"bg_color": "#FFF2CC"})
 
-        # Usa os próprios DataFrames para definir o intervalo do filtro.
-        # Não usamos ws.dim_rowmax/ws.dim_colmax porque o XlsxWriter pode
-        # deixá-los como None em planilhas sem linhas/colunas de dados.
         sheet_frames = {
             "Resumo": pd.DataFrame([summary]),
             "Cargos": roles_df,
-            "Detalhado": detail_df,
+            "Detalhado EPI": detail_df,
             "Faltas EPI": missing_epi_df,
-            "Cargos ausentes": missing_roles_df,
-            "Extras sistema": extras_df,
+            "Cargos ausentes EPI": missing_roles_df,
+            "Extras EPI": extras_df,
+            "Cargos x Inventário": risk_roles_df,
+            "Detalhado Riscos": risk_detail_df,
+            "Faltas Riscos": risk_missing_df,
+            "Extras Riscos": risk_extras_df,
+            "Cargos ausentes Risco": risk_missing_roles_df,
         }
 
         for sheet_name, df in sheet_frames.items():
@@ -716,36 +1349,49 @@ def build_excel(summary, roles_df, detail_df, missing_epi_df, missing_roles_df, 
             ws.freeze_panes(1, 0)
 
             if len(df.columns) > 0:
-                # Linha 0 é o cabeçalho; a última linha de dados é len(df).
                 last_row = max(0, len(df))
                 last_col = len(df.columns) - 1
                 ws.autofilter(0, 0, last_row, last_col)
 
-        # Reaplica larguras de forma simples.
-        for sheet_name, df in [
-            ("Cargos", roles_df),
-            ("Detalhado", detail_df),
-            ("Faltas EPI", missing_epi_df),
-            ("Cargos ausentes", missing_roles_df),
-            ("Extras sistema", extras_df),
-        ]:
-            ws = writer.sheets[sheet_name]
             for idx, col in enumerate(df.columns):
                 width = min(max(len(str(col)) + 2, 14), 45)
                 if not df.empty:
                     sample = df[col].astype(str).head(100)
-                    width = min(max(width, int(sample.map(len).max()) + 2), 55)
+                    width = min(max(width, int(sample.map(len).max()) + 2), 60)
                 ws.set_column(idx, idx, width)
-            for idx, col in enumerate(df.columns):
                 ws.write(0, idx, col, header_fmt)
 
-            if sheet_name == "Detalhado" and not df.empty:
-                status_col = df.columns.get_loc("Status")
-                for row_idx, val in enumerate(df["Status"].astype(str), start=1):
-                    if val.startswith("OK"):
-                        ws.write(row_idx, status_col, val, ok_fmt)
-                    elif val.startswith("FALTA"):
-                        ws.write(row_idx, status_col, val, fail_fmt)
+        if not detail_df.empty and "Status" in detail_df.columns:
+            ws = writer.sheets["Detalhado EPI"]
+            status_col = detail_df.columns.get_loc("Status")
+            for row_idx, val in enumerate(detail_df["Status"].astype(str), start=1):
+                if val.startswith("OK"):
+                    ws.write(row_idx, status_col, val, ok_fmt)
+                elif val.startswith("FALTA"):
+                    ws.write(row_idx, status_col, val, fail_fmt)
+                elif "PROVÁVEL" in val:
+                    ws.write(row_idx, status_col, val, probable_fmt)
+
+        if not risk_detail_df.empty and "Status" in risk_detail_df.columns:
+            ws = writer.sheets["Detalhado Riscos"]
+            status_col = risk_detail_df.columns.get_loc("Status")
+            for row_idx, val in enumerate(risk_detail_df["Status"].astype(str), start=1):
+                if val == "ATENDIDO":
+                    ws.write(row_idx, status_col, val, ok_fmt)
+                elif "PROVÁVEL" in val:
+                    ws.write(row_idx, status_col, val, probable_fmt)
+
+        if not risk_missing_df.empty:
+            ws = writer.sheets["Faltas Riscos"]
+            status_col = risk_missing_df.columns.get_loc("Status")
+            for row_idx, val in enumerate(risk_missing_df["Status"].astype(str), start=1):
+                ws.write(row_idx, status_col, val, fail_fmt)
+
+        if not risk_extras_df.empty:
+            ws = writer.sheets["Extras Riscos"]
+            status_col = risk_extras_df.columns.get_loc("Status")
+            for row_idx, val in enumerate(risk_extras_df["Status"].astype(str), start=1):
+                ws.write(row_idx, status_col, val, probable_fmt)
 
     output.seek(0)
     return output.getvalue()
@@ -755,69 +1401,98 @@ def build_excel(summary, roles_df, detail_df, missing_epi_df, missing_roles_df, 
 # Interface
 # -----------------------------------------------------------------------------
 
-st.title("🦺 Auditor de EPIs — Anexo IV do PGR × Sistema")
+st.title("🦺 Auditor de EPIs e Riscos — PGR × Sistema")
 st.markdown(
-    "O sistema verifica se **todo EPI marcado no Anexo IV do PGR aparece no relatório do sistema para o respectivo cargo**. "
-    "EPIs adicionais no sistema não geram falta."
+    "O aplicativo cruza **3 arquivos**: o relatório do sistema, o Anexo IV (Inventário de EPIs) "
+    "e o Anexo I (Inventário de Riscos). Ele verifica tanto o atendimento dos EPIs quanto dos riscos."
 )
 
 with st.sidebar:
     st.header("Arquivos")
-    st.caption("Para esta versão, use preferencialmente o Anexo IV em Excel (.xlsx).")
+    st.caption("Envie os 3 arquivos para realizar a auditoria completa.")
+
     report_file = st.file_uploader(
         "1. Relatório do sistema",
         type=["xlsx", "xls"],
         key="report",
     )
+
     pgr_file = st.file_uploader(
-        "2. Anexo IV do PGR",
+        "2. Anexo IV — Inventário de EPIs",
         type=["xlsx", "xls"],
         key="pgr",
     )
 
-    st.divider()
-    st.caption("Critério: qualquer célula preenchida no cruzamento Cargo × EPI do PGR é tratada como EPI exigido. Os valores O e E são preservados no relatório, sem interpretar o significado deles.")
+    inventory_file = st.file_uploader(
+        "3. Anexo I — Inventário de Riscos",
+        type=["xlsx", "xls"],
+        key="inventory",
+    )
 
-if not report_file or not pgr_file:
-    st.info("Envie os dois arquivos na barra lateral para iniciar a análise.")
+    st.divider()
+    st.caption(
+        "EPIs: qualquer célula preenchida no cruzamento Cargo × EPI do Anexo IV é tratada como EPI exigido. "
+        "Riscos: o aplicativo compara os riscos do relatório com os perigos/riscos registrados no Anexo I, "
+        "considerando família e marcadores específicos para evitar falsos positivos."
+    )
+
+if not report_file or not pgr_file or not inventory_file:
+    st.info("Envie os três arquivos na barra lateral para iniciar a auditoria completa.")
     st.stop()
 
 try:
     report = read_report(report_file.getvalue())
     pgr, epi_names = read_pgr(pgr_file.getvalue())
+    inventory = read_inventory(inventory_file.getvalue())
 except Exception as exc:
     st.error(f"Não foi possível ler os arquivos: {exc}")
     st.stop()
 
-with st.spinner("Cruzando cargos e EPIs..."):
-    summary, roles_df, detail_df, missing_epi_df, missing_roles_df, extras_df = analyze(
-        report, pgr, epi_names
-    )
+with st.spinner("Cruzando cargos, EPIs e riscos..."):
+    (
+        summary_epi,
+        roles_df,
+        detail_df,
+        missing_epi_df,
+        missing_roles_df,
+        extras_df,
+    ) = analyze(report, pgr, epi_names)
 
+    (
+        summary_risk,
+        risk_roles_df,
+        risk_detail_df,
+        risk_missing_df,
+        risk_extras_df,
+        risk_missing_roles_df,
+    ) = analyze_risks(report, inventory)
+
+summary = {**summary_epi, **summary_risk}
+
+st.subheader("🦺 Auditoria de EPIs")
 m1, m2, m3, m4, m5 = st.columns(5)
-m1.metric("Cargos no PGR", summary["cargos_pgr"])
+m1.metric("Cargos no Anexo IV", summary["cargos_pgr"])
 m2.metric("Cargos atendidos", summary["cargos_atendidos"])
-m3.metric("Cargos com falta", summary["cargos_com_falha"])
+m3.metric("Cargos com falta EPI", summary["cargos_com_falha"])
 m4.metric("Cargos não encontrados", summary["cargos_nao_encontrados"])
 m5.metric("EPIs em falta", summary["epis_em_falta"])
 
-st.divider()
-
 if summary["epis_em_falta"] == 0 and summary["cargos_nao_encontrados"] == 0:
-    st.success("Nenhuma falta foi encontrada pelo critério automático da análise.")
+    st.success("EPIs: nenhuma falta foi encontrada pelo critério automático da análise.")
 else:
-    st.warning("Existem cargos ou EPIs do PGR que não foram localizados automaticamente no relatório do sistema.")
+    st.warning("EPIs: existem cargos ou EPIs do Anexo IV que não foram localizados automaticamente no sistema.")
 
-# Filtros rápidos
 if not detail_df.empty:
-    cargos_filter = st.multiselect(
-        "Filtrar cargo",
-        sorted(detail_df["Cargo PGR"].unique()),
-    )
     status_options = st.multiselect(
-        "Filtrar status",
+        "Status EPI",
         ["OK", "OK — CORRESPONDÊNCIA PROVÁVEL", "FALTA", "FALTA — CARGO NÃO ENCONTRADO"],
         default=["FALTA", "FALTA — CARGO NÃO ENCONTRADO"],
+        key="epi_status_filter",
+    )
+    cargos_filter = st.multiselect(
+        "Filtrar cargo — EPI",
+        sorted(detail_df["Cargo PGR"].unique()),
+        key="epi_role_filter",
     )
     view = detail_df.copy()
     if cargos_filter:
@@ -825,21 +1500,56 @@ if not detail_df.empty:
     if status_options:
         view = view[view["Status"].isin(status_options)]
 
-    st.subheader("🔎 Pendências / conferência")
-    st.dataframe(view, use_container_width=True, hide_index=True)
+    with st.expander("🔎 Pendências de EPI / conferência", expanded=True):
+        st.dataframe(view, use_container_width=True, hide_index=True)
 
-st.subheader("📋 Cargos do PGR")
-st.dataframe(roles_df, use_container_width=True, hide_index=True)
+st.subheader("⚠️ Auditoria de Riscos — Anexo I")
+r1, r2, r3, r4, r5 = st.columns(5)
+r1.metric("Cargos com inventário", summary["cargos_inventario"])
+r2.metric("Cargos sem Anexo I", summary["cargos_sem_inventario"])
+r3.metric("Riscos atendidos", summary["riscos_atendidos"])
+r4.metric("Riscos em falta", summary["riscos_em_falta"])
+r5.metric("Riscos extras no sistema", summary["riscos_extras_sistema"])
 
-with st.expander("Ver EPIs extras cadastrados no sistema"):
+if summary["riscos_em_falta"] == 0 and summary["cargos_sem_inventario"] == 0:
+    st.success("Riscos: nenhum risco do Anexo I ficou sem correspondência no sistema.")
+else:
+    st.warning("Riscos: existem riscos do Anexo I sem correspondência no sistema ou cargos que não foram encontrados no inventário.")
+
+if not risk_missing_df.empty:
+    with st.expander("🚨 Riscos do Anexo I que NÃO aparecem no sistema", expanded=True):
+        st.dataframe(risk_missing_df, use_container_width=True, hide_index=True)
+
+with st.expander("➕ Riscos encontrados no sistema que NÃO aparecem no Anexo I"):
+    if risk_extras_df.empty:
+        st.write("Nenhum risco extra foi identificado.")
+    else:
+        st.dataframe(risk_extras_df, use_container_width=True, hide_index=True)
+
+with st.expander("✅ Detalhamento das correspondências de riscos"):
+    if risk_detail_df.empty:
+        st.write("Nenhuma correspondência de risco foi gerada.")
+    else:
+        st.dataframe(risk_detail_df, use_container_width=True, hide_index=True)
+
+with st.expander("📋 Cargos do sistema × Anexo I"):
+    st.dataframe(risk_roles_df, use_container_width=True, hide_index=True)
+
+with st.expander("⚠️ Cargos do sistema sem correspondência no Anexo I"):
+    if risk_missing_roles_df.empty:
+        st.write("Todos os cargos do sistema tiveram alguma correspondência automática no Anexo I.")
+    else:
+        st.dataframe(risk_missing_roles_df, use_container_width=True, hide_index=True)
+
+with st.expander("🦺 Ver EPIs extras cadastrados no sistema"):
     if extras_df.empty:
         st.write("Nenhum EPI extra foi identificado.")
     else:
         st.dataframe(extras_df, use_container_width=True, hide_index=True)
 
-with st.expander("Ver cargos do PGR sem correspondência no relatório"):
+with st.expander("📋 Ver cargos do Anexo IV sem correspondência no relatório"):
     if missing_roles_df.empty:
-        st.write("Todos os cargos tiveram alguma correspondência automática.")
+        st.write("Todos os cargos do Anexo IV tiveram alguma correspondência automática.")
     else:
         st.dataframe(missing_roles_df, use_container_width=True, hide_index=True)
 
@@ -850,16 +1560,22 @@ excel_bytes = build_excel(
     missing_epi_df,
     missing_roles_df,
     extras_df,
+    risk_roles_df,
+    risk_detail_df,
+    risk_missing_df,
+    risk_extras_df,
+    risk_missing_roles_df,
 )
 
 st.download_button(
-    "⬇️ Baixar auditoria em Excel",
+    "⬇️ Baixar auditoria completa em Excel",
     data=excel_bytes,
-    file_name="auditoria_pgr_x_sistema_epi.xlsx",
+    file_name="auditoria_pgr_x_sistema_epi_riscos.xlsx",
     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
 )
 
 st.caption(
-    "Observação: correspondências com confiança intermediária são marcadas como 'provável' para conferência humana. "
-    "Isso é especialmente útil quando o relatório usa abreviações ou nomes de cargo diferentes do PGR."
+    "A auditoria de riscos usa correspondência semântica conservadora: a família do risco precisa ser compatível "
+    "e marcadores específicos (altura, espaço confinado, ruído, calor, químicos etc.) são preservados. "
+    "Correspondências intermediárias aparecem como 'provável' para conferência humana."
 )
