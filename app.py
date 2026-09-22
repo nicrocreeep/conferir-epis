@@ -86,7 +86,22 @@ def role_key_without_fillers(text: str) -> str:
 
 
 def normalize_epi(text: str) -> str:
-    return normalize_text(text, keep_numbers=True)
+    """Normaliza nomes de EPI com pequenas variações de cadastro.
+
+    Além da normalização geral, trata variações comuns observadas no relatório:
+    - LUVA / LUVAS
+    - ANTI CORTE / ANTICORTE
+    """
+    normalized = normalize_text(text, keep_numbers=True)
+
+    # Variações de singular/plural que não mudam o EPI.
+    normalized = re.sub(r"\bLUVAS\b", "LUVA", normalized)
+
+    # O cadastro pode trazer "ANTI CORTE" entre parênteses, enquanto o PGR
+    # usa "ANTICORTE" como uma única palavra. Devem ser equivalentes.
+    normalized = re.sub(r"\bANTI\s+CORTE\b", "ANTICORTE", normalized)
+
+    return normalize_spaces(normalized)
 
 
 # -----------------------------------------------------------------------------
