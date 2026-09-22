@@ -314,7 +314,6 @@ def epi_compatible(required: str, candidate: str) -> bool:
         ("CONCHA", ["CONCHA"]),
         ("CHUVA", ["CHUVA"]),
         ("BARBEIRO", ["BARBEIRO"]),
-        ("TALABARTE DUPLO", ["DUPLO"]),
         ("BOTA", ["BOTA"]),
         ("BOTINA", ["BOTINA"]),
         ("FACIAL INTEIRA", ["FACIAL INTEIRA"]),
@@ -325,6 +324,19 @@ def epi_compatible(required: str, candidate: str) -> bool:
     for trigger, accepted in required_markers:
         if trigger in r and not any(a in c for a in accepted):
             return False
+
+    # TALABARTE: o PGR pode exigir especificamente o modelo DUPLO.
+    # Nesse caso, um "Talabarte de Segurança" genérico NÃO atende.
+    # Um "Talabarte de Segurança Duplo Retrátil", por exemplo, atende,
+    # pois mantém a característica obrigatória "DUPLO" e apenas acrescenta
+    # uma especificação adicional (RETRÁTIL).
+    if "TALABARTE" in r:
+        if "DUPLO" in r and "DUPLO" not in c:
+            return False
+        if "DUPLO" not in r and "DUPLO" in c:
+            # Um talabarte duplo pode ser mais específico que o genérico.
+            # Mantemos a compatibilidade nesse sentido.
+            pass
 
     # Para EPIs com nome-base muito característico, exige que o mesmo item apareça.
     # Isso evita que um fuzzy genérico transforme "MANGOTE" em "CAPACETE", por exemplo.
@@ -404,9 +416,15 @@ def match_epi(required_epi: str, report_epis: List[str]) -> Tuple[bool, str, flo
         score = max(score_set, score_partial)
 
         # Regras específicas do vocabulário observado no relatório.
-        if "TALABARTE" in r and "TALABARTE" in c and "DUPLO" in r:
+        # "Talabarte de Segurança Duplo" exige que o candidato também tenha
+        # a característica "DUPLO". Assim evitamos aceitar um talabarte genérico.
+        if "TALABARTE" in r and "DUPLO" in r:
             if "DUPLO" not in c:
-                score -= 15
+                continue
+            # Se o candidato tiver palavras adicionais, como RETRÁTIL, isso
+            # é aceito; não reduzimos a pontuação por ser mais específico.
+            if "RETRATIL" in c:
+                score += 5
         if "TONALIDADE 5" in r and "TONALIDADE 5" in c:
             score += 12
         if "TONALIDADE 5" in r and "MAÇAR" in r and "MAÇAR" not in c:
