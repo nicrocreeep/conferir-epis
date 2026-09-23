@@ -1003,18 +1003,22 @@ def epi_compatible(required: str, candidate: str) -> bool:
         if trigger in r and not any(a in c for a in accepted):
             return False
 
-    # TALABARTE: o PGR pode exigir especificamente o modelo DUPLO.
-    # Nesse caso, um "Talabarte de Segurança" genérico NÃO atende.
-    # Um "Talabarte de Segurança Duplo Retrátil", por exemplo, atende,
-    # pois mantém a característica obrigatória "DUPLO" e apenas acrescenta
-    # uma especificação adicional (RETRÁTIL).
+    # TALABARTE: no cadastro do Benner, "Talabarte de Segurança"
+    # corresponde ao "TALABARTE DE SEGURANÇA DUPLO" do PGR.
+    # Já o "Talabarte de Segurança Retrátil" é outro tipo e NÃO atende.
     if "TALABARTE" in r:
-        if "DUPLO" in r and "DUPLO" not in c:
+        if "DUPLO" in r:
+            # Retrátil é uma categoria diferente para este controle.
+            if "RETRATIL" in c:
+                return False
+
+            # O Benner pode omitir a palavra "DUPLO" e registrar apenas
+            # "Talabarte de Segurança". Essa nomenclatura é considerada
+            # equivalente ao Talabarte de Segurança Duplo do PGR.
+            if "TALABARTE" not in c or "SEGURANCA" not in c:
+                return False
+        elif "RETRATIL" in r and "RETRATIL" not in c:
             return False
-        if "DUPLO" not in r and "DUPLO" in c:
-            # Um talabarte duplo pode ser mais específico que o genérico.
-            # Mantemos a compatibilidade nesse sentido.
-            pass
 
     # Luvas: além da categoria LUVA, preserva características importantes do
     # modelo exigido. Isso evita que uma luva genérica atenda outra finalidade.
@@ -1119,15 +1123,16 @@ def match_epi(required_epi: str, report_epis: List[str]) -> Tuple[bool, str, flo
         score = max(score_set, score_partial)
 
         # Regras específicas do vocabulário observado no relatório.
-        # "Talabarte de Segurança Duplo" exige que o candidato também tenha
-        # a característica "DUPLO". Assim evitamos aceitar um talabarte genérico.
+        # No Benner, "Talabarte de Segurança" representa o Talabarte Duplo
+        # do PGR. Já "Talabarte de Segurança Retrátil" é outro tipo e deve
+        # ser rejeitado.
         if "TALABARTE" in r and "DUPLO" in r:
-            if "DUPLO" not in c:
-                continue
-            # Se o candidato tiver palavras adicionais, como RETRÁTIL, isso
-            # é aceito; não reduzimos a pontuação por ser mais específico.
             if "RETRATIL" in c:
-                score += 5
+                continue
+            if "TALABARTE" not in c or "SEGURANCA" not in c:
+                continue
+            # Se o candidato também trouxer "DUPLO", ótimo; se omitir a
+            # palavra, continuamos aceitando pela regra do cadastro Benner.
         if "TONALIDADE 5" in r and "TONALIDADE 5" in c:
             score += 12
         if "TONALIDADE 5" in r and "MAÇAR" in r and "MAÇAR" not in c:
